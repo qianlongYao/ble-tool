@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BLE Tool - 网页版</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #0f172a; color: #e2e8f0; min-height: 100vh; padding: 16px;
+  }
+  .container { max-width: 560px; margin: 0 auto; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .sub { color: #94a3b8; font-size: 12px; margin-bottom: 16px; }
+  .card {
+    background: #1e293b; border: 1px solid #334155; border-radius: 12px;
+    padding: 14px; margin-bottom: 12px;
+  }
+  .card h2 { font-size: 14px; color: #7dd3fc; margin-bottom: 10px; }
+  button {
+    background: #2563eb; color: #fff; border: none; border-radius: 8px;
+    padding: 10px 18px; font-size: 14px; cursor: pointer;
+  }
+  button:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
+  button.secondary { background: #334155; }
+  .status {
+    background: #0b1220; border: 1px solid #334155; border-radius: 8px;
+    padding: 8px 10px; font-size: 13px; color: #94a3b8; margin-bottom: 12px;
+    word-break: break-all; min-height: 20px;
+  }
+  .device {
+    padding: 8px 10px; border: 1px solid #334155; border-radius: 8px;
+    margin-bottom: 6px; cursor: pointer; background: #0f172a;
+  }
+  .device:hover { border-color: #2563eb; }
+  .device .name { font-size: 14px; }
+  .device .addr { font-size: 11px; color: #64748b; }
+  .list-item {
+    padding: 6px 10px; border: 1px solid #334155; border-radius: 8px;
+    margin-bottom: 5px; font-size: 13px; cursor: pointer; background: #0f172a;
+  }
+  .list-item.selected { border-color: #2563eb; background: #1e3a8a; }
+  .list-item .props { color: #7dd3fc; font-size: 11px; margin-left: 6px; }
+  .row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+  input[type=text] {
+    flex: 1; background: #0f172a; color: #e2e8f0; border: 1px solid #334155;
+    border-radius: 8px; padding: 8px 10px; font-size: 13px; font-family: monospace;
+  }
+  .hexbox {
+    background: #0b1220; border: 1px solid #334155; border-radius: 8px;
+    padding: 8px 10px; font-family: monospace; font-size: 12px;
+    color: #a5f3fc; margin-top: 8px; min-height: 60px; word-break: break-all;
+    white-space: pre-wrap;
+  }
+  .hint { color: #64748b; font-size: 11px; margin-top: 6px; }
+  .empty { color: #475569; font-size: 12px; text-align: center; padding: 8px; }
+  a { color: #7dd3fc; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>BLE Tool</h1>
+  <div class="sub">网页版蓝牙调试工具 · 需 Chrome/Edge · 无需安装</div>
+
+  <div class="status" id="status">就绪。点击「扫描设备」开始。</div>
+
+  <div class="card">
+    <h2>连接</h2>
+    <button id="scanBtn" onclick="connect()">扫描并连接 BLE 设备</button>
+    <div class="hint">手机需开启蓝牙。Chrome 会弹出设备选择框。</div>
+  </div>
+
+  <div class="card">
+    <h2>服务</h2>
+    <div id="svcList"><div class="empty">未连接设备</div></div>
+  </div>
+
+  <div class="card">
+    <h2>特征值</h2>
+    <div id="charList"><div class="empty">请先选择服务</div></div>
+  </div>
+
+  <div class="card">
+    <h2>读写</h2>
+    <div class="row">
+      <button id="readBtn" onclick="readChar()" disabled>读取</button>
+      <input type="text" id="writeInput" placeholder="HEX: 01 02 AB" disabled>
+      <button id="writeBtn" onclick="writeChar()" disabled>写入</button>
+    </div>
+    <div class="hexbox" id="hexData">(选择特征后点击读取)</div>
+    <div class="hint">读取/写入针对上方选中的特征。写入内容为十六进制，如 01 02 FF。</div>
+  </div>
+</div>
+
+<script>
+let server = null;
+let selectedService = null;
+let selectedChar = null;
+let chars = [];
+
+const $ = id => document.getElementById(id);
+const setStatus = msg => {
+  $('status').textContent = msg;
+  console.log('[BLE]', msg);
+};
+const hexToBytes = hex => {
+  hex = hex.replace(/[\s,]/g, '').replace(/[^0-9a-fA-F]/g, '');
+  if (!hex || hex.length % 2) return null;
+  const out = [];
+  for (let i = 0; i < hex.length; i += 2) out.push(parseInt(hex.substr(i, 2), 16));
+  return new Uint8Array(out);
+};
+const bytesToHex = arr => {
+  const lines = [];
+  for (let i = 0; i < arr.length; i += 16) {
+    const chunk = Array.from(arr.slice(i, i + 16)).map(b => b.toString(16).padStart(2, '0').toUpperCase());
+    lines.push(chunk.join(' '));
+  }
+  return lines.join('\n') || '(空)';
+};
+
+async function connect() {
+  if (!navigator.bluetooth) {
+    setStatus('此浏览器不支持 Web Bluetooth。请用 Chrome 或 Edge（Android 版 Chrome 支持）。');
+    return;
+  }
+  try {
+    setStatus('请求蓝牙连接…');
+    const device = await navigator.bluetooth.requestDevice({
+      acceptAllDevices: true,
+      optionalServices: []
+    });
+    device.addEventListener('gattserverdisconnected', () => {
+      setStatus('设备已断开连接');
+      $('svcList').innerHTML = '<div class="empty">未连接设备</div>';
+      $('charList').innerHTML = '<div class="empty">请先选择服务</div>';
+      resetState();
+    });
+    setStatus('连接中: ' + (device.name || '未知设备'));
+    server = await device.gatt.connect();
+    setStatus('已连接: ' + (device.name || '未知设备') + ' — 正在读取服务…');
+    await listServices();
+  } catch (e) {
+    if (e.name !== 'NotFoundError') {
+      setStatus('失败: ' + (e.message || e));
+    }
+  }
+}
+
+function resetState() {
+  server = null; selectedService = null; selectedChar = null; chars = [];
+  $('readBtn').disabled = true; $('writeBtn').disabled = true; $('writeInput').disabled = true;
+}
+
+async function listServices() {
+  if (!server) return;
+  const services = await server.getPrimaryServices();
+  const el = $('svcList');
+  el.innerHTML = '';
+  if (!services.length) {
+    el.innerHTML = '<div class="empty">无服务（可能是私有服务）</div>';
+    return;
+  }
+  for (const svc of services) {
+    const div = document.createElement('div');
+    div.className = 'list-item';
+    div.textContent = '0x' + svc.uuid.slice(4, 8) + ' — ' + svc.uuid;
+    div.onclick = async () => {
+      document.querySelectorAll('#svcList .list-item').forEach(d => d.classList.remove('selected'));
+      div.classList.add('selected');
+      selectedService = svc;
+      await listChars(svc);
+    };
+    el.appendChild(div);
+  }
+  setStatus('发现 ' + services.length + ' 个服务，点击查看特征');
+}
+
+async function listChars(svc) {
+  const el = $('charList');
+  el.innerHTML = '<div class="empty">加载特征…</div>';
+  try {
+    chars = await svc.getCharacteristics();
+  } catch (e) {
+    el.innerHTML = '<div class="empty">读取特征失败: ' + e.message + '</div>';
+    return;
+  }
+  el.innerHTML = '';
+  if (!chars.length) {
+    el.innerHTML = '<div class="empty">该服务无特征</div>';
+    return;
+  }
+  for (const ch of chars) {
+    const div = document.createElement('div');
+    div.className = 'list-item';
+    const props = [];
+    if (ch.properties.read) props.push('R');
+    if (ch.properties.write || ch.properties.writeWithoutResponse) props.push('W');
+    if (ch.properties.notify) props.push('N');
+    const span = document.createElement('span');
+    span.textContent = '0x' + ch.uuid.slice(4, 8);
+    const propsEl = document.createElement('span');
+    propsEl.className = 'props';
+    propsEl.textContent = '[' + props.join('') + ']';
+    div.appendChild(span); div.appendChild(propsEl);
+    div.onclick = () => {
+      document.querySelectorAll('#charList .list-item').forEach(d => d.classList.remove('selected'));
+      div.classList.add('selected');
+      selectedChar = ch;
+      $('readBtn').disabled = !ch.properties.read;
+      const canWrite = ch.properties.write || ch.properties.writeWithoutResponse;
+      $('writeBtn').disabled = !canWrite; $('writeInput').disabled = !canWrite;
+      $('hexData').textContent = '(已选择 ' + ch.uuid + ')';
+      setStatus('已选择特征 0x' + ch.uuid.slice(4, 8));
+      // 若支持通知，自动订阅
+      if (ch.properties.notify) setupNotify(ch);
+    };
+    el.appendChild(div);
+  }
+  setStatus('发现 ' + chars.length + ' 个特征，点击选择');
+}
+
+async function setupNotify(ch) {
+  try {
+    await ch.startNotifications();
+    ch.addEventListener('characteristicvaluechanged', e => {
+      const val = e.target.value;
+      $('hexData').textContent = '通知数据:\n' + bytesToHex(new Uint8Array(val.buffer));
+      setStatus('收到通知 ' + val.byteLength + ' 字节');
+    });
+    setStatus('已订阅通知');
+  } catch (e) {
+    // 通知订阅失败不影响其他功能
+    console.warn('notify failed', e);
+  }
+}
+
+async function readChar() {
+  if (!selectedChar) { setStatus('请先选择特征'); return; }
+  try {
+    setStatus('读取中…');
+    const val = await selectedChar.readValue();
+    $('hexData').textContent = '读取 ' + val.byteLength + ' 字节:\n' + bytesToHex(new Uint8Array(val.buffer));
+    setStatus('读取完成 ' + val.byteLength + ' 字节');
+  } catch (e) {
+    setStatus('读取失败: ' + (e.message || e));
+  }
+}
+
+async function writeChar() {
+  if (!selectedChar) { setStatus('请先选择特征'); return; }
+  const data = hexToBytes($('writeInput').value);
+  if (!data) { setStatus('写入内容需为偶数长度的十六进制'); return; }
+  try {
+    const withResponse = selectedChar.properties.write === true;
+    if (withResponse) {
+      await selectedChar.writeValue(data);
+    } else if (selectedChar.properties.writeWithoutResponse) {
+      await selectedChar.writeValueWithoutResponse(data);
+    } else {
+      setStatus('该特征不支持写入'); return;
+    }
+    setStatus('写入成功 ' + data.length + ' 字节');
+  } catch (e) {
+    setStatus('写入失败: ' + (e.message || e));
+  }
+}
+</script>
+</body>
+</html>
